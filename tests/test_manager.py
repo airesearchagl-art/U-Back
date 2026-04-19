@@ -3,13 +3,17 @@
 import json
 import os
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from uback.manager import (
     BackupManager,
+    CleanupStats,
+    RetentionPolicy,
     _SNAPSHOT_FMT,
+    _freeable_bytes,
     _parse_snapshot_name,
     find_latest_snapshot,
     find_snapshots,
@@ -193,3 +197,192 @@ def test_multiple_runs_accumulate_snapshots(tmp_path):
 def test_missing_source_raises(tmp_path):
     with pytest.raises(ValueError, match="source is not a directory"):
         BackupManager(tmp_path / "no_such_dir", tmp_path / "nas").run()
+
+
+# ===========================================================================
+# Retention / cleanup tests
+# ===========================================================================
+
+def _make_snapshots(nas: Path, names: list[str]) -> None:
+    """Create dummy snapshot directories with a single file each."""
+    for name in names:
+        d = nas / name
+        d.mkdir(parents=True)
+        (d / "file.txt").write_bytes(b"data")
+
+
+def _snap_names(nas: Path) -> list[str]:
+    return sorted(p.name for _, p in find_snapshots(nas))
+
+
+# ---------------------------------------------------------------------------
+# _freeable_bytes
+# ---------------------------------------------------------------------------
+
+def test_freeable_bytes_sole_file(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_bytes(b"hello")
+    assert _freeable_bytes(tmp_path) == 5
+
+
+def test_freeable_bytes_excludes_hardlinked(tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_bytes(b"shared")
+    link = tmp_path / "link.txt"
+    os.link(src, link)
+    # Both nlink==2 → neither counted as freeable
+    assert _freeable_bytes(tmp_path) == 0
+
+
+# ---------------------------------------------------------------------------
+# cleanup_old_snapshots — basic deletion
+# ---------------------------------------------------------------------------
+
+def test_cleanup_deletes_expired_snapshots(tmp_path):
+    nas = tmp_path / "nas"
+    # Old snapshots (35 days ago)
+    old_names = ["2026-01-01-000000", "2026-01-02-000000"]
+    # Recent snapshots (today-ish, won't be expired)
+    recent_names = ["2026-04-19-000000", "2026-04-19-000001"]
+    _make_snapshots(nas, old_names + recent_names)
+
+    src = make_source(tmp_path, {"x.txt": b"x"})
+    policy = RetentionPolicy(keep_count=2, max_age_days=30)
+    mgr = BackupManager(src, nas)
+
+    now = datetime(2026, 4, 19, 12, 0, 0)
+    stats = mgr.cleanup_old_snapshots(policy, _now=now)
+
+    assert stats.deleted == 2
+    assert stats.kept == 0
+    assert stats.errors == 0
+    remaining = _snap_names(nas)
+    assert "2026-01-01-000000" not in remaining
+    assert "2026-01-02-000000" not in remaining
+    assert "2026-04-19-000000" in remaining
+    assert "2026-04-19-000001" in remaining
+
+
+def test_cleanup_keeps_recent_outside_window(tmp_path):
+    """Snapshots beyond keep_count but not yet expired should be kept."""
+    nas = tmp_path / "nas"
+    # 20 days old — beyond keep_count=2 but within max_age_days=30
+    _make_snapshots(nas, [
+        "2026-03-30-000000",  # 20 days old
+        "2026-04-15-000000",  # 4 days old
+        "2026-04-19-000000",  # today
+    ])
+
+    src = make_source(tmp_path, {"x.txt": b"x"})
+    mgr = BackupManager(src, nas)
+    policy = RetentionPolicy(keep_count=2, max_age_days=30)
+
+    now = datetime(2026, 4, 19, 12, 0, 0)
+    stats = mgr.cleanup_old_snapshots(policy, _now=now)
+
+    assert stats.deleted == 0
+    assert stats.kept == 1          # "2026-03-30-000000" is old but not expired
+    assert len(_snap_names(nas)) == 3
+
+
+# ---------------------------------------------------------------------------
+# cleanup_old_snapshots — keep_count protects newest N
+# ---------------------------------------------------------------------------
+
+def test_cleanup_never_deletes_within_keep_count(tmp_path):
+    nas = tmp_path / "nas"
+    # All 5 are "old" (100 days ago), but keep_count=5 protects all of them
+    _make_snapshots(nas, [
+        "2026-01-01-000000",
+        "2026-01-02-000000",
+        "2026-01-03-000000",
+        "2026-01-04-000000",
+        "2026-01-05-000000",
+    ])
+
+    src = make_source(tmp_path, {"x.txt": b"x"})
+    mgr = BackupManager(src, nas)
+    policy = RetentionPolicy(keep_count=5, max_age_days=1)
+
+    now = datetime(2026, 4, 19, 0, 0, 0)
+    stats = mgr.cleanup_old_snapshots(policy, _now=now)
+
+    assert stats.deleted == 0
+    assert len(_snap_names(nas)) == 5
+
+
+def test_cleanup_deletes_only_beyond_keep_count(tmp_path):
+    nas = tmp_path / "nas"
+    # 6 old snapshots, keep_count=4 → oldest 2 are candidates
+    names = [f"2026-01-0{i}-000000" for i in range(1, 7)]
+    _make_snapshots(nas, names)
+
+    src = make_source(tmp_path, {"x.txt": b"x"})
+    mgr = BackupManager(src, nas)
+    policy = RetentionPolicy(keep_count=4, max_age_days=1)
+
+    now = datetime(2026, 4, 19, 0, 0, 0)
+    stats = mgr.cleanup_old_snapshots(policy, _now=now)
+
+    assert stats.deleted == 2
+    remaining = _snap_names(nas)
+    assert len(remaining) == 4
+    # Oldest two should be gone
+    assert "2026-01-01-000000" not in remaining
+    assert "2026-01-02-000000" not in remaining
+
+
+# ---------------------------------------------------------------------------
+# BackupManager.run() auto-cleanup integration
+# ---------------------------------------------------------------------------
+
+def test_run_triggers_cleanup_when_retention_set(tmp_path):
+    src = make_source(tmp_path, {"f.txt": b"data"})
+    nas = tmp_path / "nas"
+
+    # Pre-populate 3 old snapshots (100 days old)
+    _make_snapshots(nas, [
+        "2026-01-01-000000",
+        "2026-01-02-000000",
+        "2026-01-03-000000",
+    ])
+
+    policy = RetentionPolicy(keep_count=2, max_age_days=30)
+    session = BackupManager(src, nas, retention=policy).run()
+
+    assert session.cleanup is not None
+    # After run: 4 snapshots total (3 old + 1 new).
+    # keep_count=2 protects newest 2 → 2 candidates → both >30 days → deleted.
+    assert session.cleanup.deleted == 2
+    snaps = find_snapshots(nas)
+    assert len(snaps) == 2
+
+
+def test_run_no_cleanup_when_retention_is_none(tmp_path):
+    src = make_source(tmp_path, {"f.txt": b"data"})
+    nas = tmp_path / "nas"
+
+    session = BackupManager(src, nas, retention=None).run()
+
+    assert session.cleanup is None
+
+
+# ---------------------------------------------------------------------------
+# freed_bytes tracking
+# ---------------------------------------------------------------------------
+
+def test_cleanup_reports_freed_bytes(tmp_path):
+    nas = tmp_path / "nas"
+    old = nas / "2026-01-01-000000"
+    old.mkdir(parents=True)
+    (old / "unique.txt").write_bytes(b"x" * 1000)  # nlink==1 → will be freed
+
+    src = make_source(tmp_path, {"f.txt": b"y"})
+    mgr = BackupManager(src, nas)
+    policy = RetentionPolicy(keep_count=0, max_age_days=1)
+
+    now = datetime(2026, 4, 19, 0, 0, 0)
+    stats = mgr.cleanup_old_snapshots(policy, _now=now)
+
+    assert stats.deleted == 1
+    assert stats.freed_bytes == 1000

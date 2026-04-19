@@ -7,6 +7,7 @@ Wraps BackupEngine to provide a fully automated snapshot workflow:
   3. Create a new snapshot folder named after the current time
   4. Run BackupEngine
   5. Write backup_info.json into the new snapshot folder
+  6. Apply retention policy to prune old snapshots (if configured)
 """
 
 from __future__ import annotations
@@ -14,9 +15,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import time
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .backup_engine import BackupEngine, BackupStats
@@ -69,7 +71,6 @@ def find_snapshots(base_dir: Path) -> list[tuple[datetime, Path]]:
         if parsed is not None:
             results.append((parsed, entry))
     results.sort(key=lambda t: t[0])
-    # Return without the internal counter in the public tuple
     return [(dt, path) for (dt, _counter), path in results]
 
 
@@ -93,6 +94,74 @@ def _new_snapshot_name(base_dir: Path) -> str:
         counter += 1
         name = f"{base}-{counter}"
     return name
+
+
+# ---------------------------------------------------------------------------
+# Retention policy
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RetentionPolicy:
+    """
+    Rules for pruning old snapshots.
+
+    Attributes:
+        keep_count:   Always preserve this many of the most recent snapshots,
+                      regardless of age.
+        max_age_days: Delete snapshots older than this many days, but only
+                      when they fall outside the keep_count window.
+    """
+    keep_count: int = 10
+    max_age_days: float = 30
+
+
+@dataclass
+class CleanupStats:
+    deleted: int = 0
+    freed_bytes: int = 0   # bytes from files that had nlink==1 (sole reference)
+    kept: int = 0          # old snapshots intentionally retained (not yet expired)
+    errors: int = 0
+
+
+def _freeable_bytes(snapshot_dir: Path) -> int:
+    """
+    Estimate bytes that will be freed when *snapshot_dir* is deleted.
+
+    Only files whose hard-link count is 1 are the sole reference to their
+    data; those blocks will be released by the OS when the directory entry
+    is removed.  Files with nlink > 1 are shared with other snapshots and
+    their data survives deletion of this snapshot.
+    """
+    total = 0
+    for p in snapshot_dir.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            try:
+                st = p.stat()
+                if st.st_nlink == 1:
+                    total += st.st_size
+            except OSError:
+                pass
+    return total
+
+
+def _delete_snapshot(snapshot_dir: Path, stats: CleanupStats) -> None:
+    """
+    Remove a snapshot directory tree.
+
+    shutil.rmtree is hard-link safe: it removes directory entries one by
+    one, decrementing each inode's link count.  Files shared with other
+    snapshots (nlink > 1) are unaffected because their data is only freed
+    when the last reference is removed.
+    """
+    freed = _freeable_bytes(snapshot_dir)
+    try:
+        shutil.rmtree(snapshot_dir)
+        stats.deleted += 1
+        stats.freed_bytes += freed
+        log.info("Deleted snapshot: %s (freed ~%d bytes)", snapshot_dir.name, freed)
+    except OSError as exc:
+        log.error("Failed to delete snapshot %s: %s", snapshot_dir.name, exc)
+        stats.errors += 1
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +222,7 @@ class BackupSession:
     info: BackupInfo
     snapshot_dir: Path
     info_path: Path
+    cleanup: CleanupStats | None = None
 
 
 class BackupManager:
@@ -164,6 +234,8 @@ class BackupManager:
         base_dir:  NAS base directory that holds all timestamped snapshots
                    (e.g. ``//NAS/Backup/MyPC``).
         use_hash:  Passed through to BackupEngine (SHA-256 vs mtime+size).
+        retention: Optional retention policy.  When set, old snapshots are
+                   pruned automatically at the end of each run().
     """
 
     def __init__(
@@ -172,11 +244,14 @@ class BackupManager:
         base_dir: Path | str,
         *,
         use_hash: bool = False,
+        retention: RetentionPolicy | None = None,
     ) -> None:
         self.source = Path(source)
         self.base_dir = Path(base_dir)
         self.use_hash = use_hash
+        self.retention = retention
 
+    # ------------------------------------------------------------------
     def run(self) -> BackupSession:
         """Execute one backup session and return a BackupSession."""
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -226,7 +301,79 @@ class BackupManager:
             elapsed, stats.copied, stats.linked, total_bytes, stats.errors,
         )
 
-        return BackupSession(info=info, snapshot_dir=snapshot_dir, info_path=info_path)
+        cleanup_stats: CleanupStats | None = None
+        if self.retention is not None:
+            cleanup_stats = self.cleanup_old_snapshots(self.retention)
+
+        return BackupSession(
+            info=info,
+            snapshot_dir=snapshot_dir,
+            info_path=info_path,
+            cleanup=cleanup_stats,
+        )
+
+    # ------------------------------------------------------------------
+    def cleanup_old_snapshots(
+        self,
+        policy: RetentionPolicy | None = None,
+        *,
+        _now: datetime | None = None,
+    ) -> CleanupStats:
+        """
+        Prune old snapshots according to *policy*.
+
+        Snapshots are evaluated oldest-first.  The *keep_count* most recent
+        snapshots are always preserved.  Among the remainder, any snapshot
+        whose timestamp is older than *max_age_days* is deleted.
+
+        Args:
+            policy: Retention policy to apply.  Falls back to
+                    ``self.retention`` when omitted; uses the default
+                    RetentionPolicy() if neither is set.
+            _now:   Reference time for age calculation.  Intended for
+                    testing; defaults to datetime.now().
+        """
+        policy = policy or self.retention or RetentionPolicy()
+        now = _now or datetime.now()
+        stats = CleanupStats()
+
+        snapshots = find_snapshots(self.base_dir)  # oldest-first
+        n = len(snapshots)
+
+        # The newest keep_count snapshots are unconditionally protected.
+        protected_from = max(0, n - policy.keep_count)
+        candidates = snapshots[:protected_from]   # older than the protected window
+
+        if not candidates:
+            log.debug(
+                "Retention: %d snapshot(s) present, all within keep_count=%d — nothing to prune",
+                n, policy.keep_count,
+            )
+            return stats
+
+        cutoff = now - timedelta(days=policy.max_age_days)
+        log.info(
+            "Retention: %d candidate(s) older than keep window; cutoff date = %s",
+            len(candidates), cutoff.strftime("%Y-%m-%d"),
+        )
+
+        for snap_dt, snap_path in candidates:
+            if snap_dt < cutoff:
+                _delete_snapshot(snap_path, stats)
+            else:
+                log.debug(
+                    "Keeping %s (age %.1f days < max_age_days=%.1f)",
+                    snap_path.name,
+                    (now - snap_dt).total_seconds() / 86400,
+                    policy.max_age_days,
+                )
+                stats.kept += 1
+
+        log.info(
+            "Cleanup done — deleted: %d, freed: ~%d bytes, kept: %d, errors: %d",
+            stats.deleted, stats.freed_bytes, stats.kept, stats.errors,
+        )
+        return stats
 
 
 # ---------------------------------------------------------------------------
@@ -250,20 +397,29 @@ def _main() -> None:
         epilog=(
             "Example:\n"
             "  python -m uback.manager C:\\Users\\you\\Documents \\\\NAS\\Backup\\Documents\n"
+            "  python -m uback.manager C:\\Users\\you\\Documents \\\\NAS\\Backup\\Documents"
+            " --keep 10 --max-age 30\n"
         ),
     )
     parser.add_argument("source", help="Local directory to back up")
     parser.add_argument("base_dir", help="NAS base directory for all snapshots")
-    parser.add_argument(
-        "--hash", action="store_true",
-        help="Use SHA-256 for change detection instead of mtime+size",
-    )
+    parser.add_argument("--hash", action="store_true",
+                        help="Use SHA-256 for change detection instead of mtime+size")
+    parser.add_argument("--keep", type=int, default=None, metavar="N",
+                        help="Always keep the N most recent snapshots (default: no pruning)")
+    parser.add_argument("--max-age", type=float, default=30, metavar="DAYS",
+                        help="Delete snapshots older than DAYS (default: 30, requires --keep)")
     args = parser.parse_args()
+
+    retention = None
+    if args.keep is not None:
+        retention = RetentionPolicy(keep_count=args.keep, max_age_days=args.max_age)
 
     manager = BackupManager(
         source=args.source,
         base_dir=args.base_dir,
         use_hash=args.hash,
+        retention=retention,
     )
     session = manager.run()
     info = session.info
@@ -276,6 +432,12 @@ def _main() -> None:
     print(f"Size     : {info.total_bytes:,} bytes")
     print(f"Elapsed  : {info.elapsed_seconds:.1f}s")
     print(f"Success  : {info.success}")
+
+    if session.cleanup is not None:
+        c = session.cleanup
+        print(f"\nCleanup  : deleted={c.deleted}, freed=~{c.freed_bytes:,} bytes, "
+              f"kept={c.kept}, errors={c.errors}")
+
     print(f"Info     : {session.info_path}")
 
 
