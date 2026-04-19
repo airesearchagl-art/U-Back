@@ -2,16 +2,20 @@
 Backup session manager.
 
 Wraps BackupEngine to provide a fully automated snapshot workflow:
-  1. Scan the NAS base directory for existing timestamped snapshots
-  2. Pick the latest one as previous_backup (or None for first run)
-  3. Create a new snapshot folder named after the current time
-  4. Run BackupEngine
-  5. Write backup_info.json into the new snapshot folder
-  6. Apply retention policy to prune old snapshots (if configured)
+  1. Check NAS reachability (raises NASUnavailableError on failure)
+  2. Acquire exclusive lock (raises BackupAlreadyRunningError if busy)
+  3. Scan the NAS base directory for existing timestamped snapshots
+  4. Pick the latest one as previous_backup (or None for first run)
+  5. Create a new snapshot folder named after the current time
+  6. Run BackupEngine
+  7. Write backup_info.json into the new snapshot folder
+  8. Apply retention policy to prune old snapshots (if configured)
+  9. Release lock
 """
 
 from __future__ import annotations
 
+import errno as _errno_module
 import json
 import logging
 import re
@@ -22,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .backup_engine import BackupEngine, BackupStats
+from .errors import NASUnavailableError
+from .lock import LOCK_FILENAME, backup_lock
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +36,44 @@ log = logging.getLogger(__name__)
 _SNAPSHOT_FMT = "%Y-%m-%d-%H%M%S"
 _SNAPSHOT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{6})(?:-(\d+))?$")
 _INFO_FILENAME = "backup_info.json"
+
+# OSError errno values that indicate the NAS share is unreachable
+_OFFLINE_ERRNOS = frozenset({
+    _errno_module.EHOSTUNREACH,   # No route to host
+    _errno_module.ETIMEDOUT,      # Connection timed out
+    _errno_module.ECONNREFUSED,   # Connection refused
+    _errno_module.ENETUNREACH,    # Network unreachable
+})
+# OSError errno values that indicate authentication / permission failure
+_AUTH_ERRNOS = frozenset({
+    _errno_module.EACCES,         # Permission denied
+    _errno_module.EPERM,          # Operation not permitted
+})
+# Windows-specific winerror codes for offline / auth (winerror attr on OSError)
+_WIN_OFFLINE_CODES = frozenset({53, 64, 67, 1231})   # bad net path / unreachable
+_WIN_AUTH_CODES = frozenset({5, 1326, 1327})          # access denied / logon failure
+
+
+def _check_nas_accessible(base_dir: Path) -> None:
+    """
+    Verify that *base_dir* can be created/accessed on the NAS.
+
+    Raises:
+        NASUnavailableError: when the share is offline or authentication fails.
+    """
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        winerr = getattr(exc, "winerror", None)
+        if winerr in _WIN_OFFLINE_CODES or exc.errno in _OFFLINE_ERRNOS:
+            raise NASUnavailableError(
+                f"NAS is offline or unreachable: {base_dir} — {exc}"
+            ) from exc
+        if winerr in _WIN_AUTH_CODES or exc.errno in _AUTH_ERRNOS:
+            raise NASUnavailableError(
+                f"Authentication error accessing NAS: {base_dir} — {exc}"
+            ) from exc
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -253,9 +297,26 @@ class BackupManager:
 
     # ------------------------------------------------------------------
     def run(self) -> BackupSession:
-        """Execute one backup session and return a BackupSession."""
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        """
+        Execute one backup session and return a BackupSession.
 
+        Raises:
+            NASUnavailableError: if the NAS share cannot be reached or
+                authentication fails.
+            BackupAlreadyRunningError: if another backup process is
+                already holding the lock.
+            ValueError: if *source* is not a directory.
+        """
+        # Step 1: verify NAS reachability before acquiring the lock so we
+        # fail fast without leaving a stale lock on the share.
+        _check_nas_accessible(self.base_dir)
+
+        lock_path = self.base_dir / LOCK_FILENAME
+        with backup_lock(lock_path):
+            return self._run_locked()
+
+    def _run_locked(self) -> BackupSession:
+        """Internal: called after the lock is held."""
         previous = find_latest_snapshot(self.base_dir)
         snapshot_name = _new_snapshot_name(self.base_dir)
         snapshot_dir = self.base_dir / snapshot_name
